@@ -3,14 +3,16 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Hand-Draw Camera</title>
+  <title>Hand-Draw Camera + Gift Box Stickers</title>
   <style>
     :root { --ui: rgba(20,20,20,.85); --accent: #4f8cff; }
     html, body { height: 100%; margin: 0; background:#000; color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
     .app { position: fixed; inset: 0; overflow: hidden; }
-    video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); /* mirror for selfie */ }
+    video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
     canvas#overlay { position: absolute; inset: 0; pointer-events: none; }
+    canvas#stickers { position: absolute; inset: 0; pointer-events: none; }
     canvas#draw { position: absolute; inset: 0; touch-action: none; }
+
     .hud { position: absolute; left: 0; right: 0; bottom: 0; display: flex; gap: .5rem; padding: .75rem; flex-wrap: wrap; justify-content: center; background: linear-gradient(180deg, transparent, rgba(0,0,0,.35)); }
     .btn, .pill { appearance: none; border: 1px solid rgba(255,255,255,.2); background: var(--ui); color: #fff; padding: .6rem .9rem; border-radius: 999px; font-size: 14px; display: inline-flex; align-items: center; gap: .5rem; backdrop-filter: blur(6px); }
     .btn:hover { background: rgba(40,40,40,.9); }
@@ -22,6 +24,14 @@
     label { font-size: 12px; opacity: .85; }
     input[type=color] { inline-size: 40px; block-size: 28px; border: none; background: transparent; padding: 0; }
     input[type=range] { width: 120px; }
+
+    /* Gift box (gesture-open side tray) */
+    .gift { position: absolute; top: 50%; right: .5rem; transform: translateY(-50%); display: grid; gap:.5rem; align-items: center; }
+    .gift-toggle { width: 52px; height: 52px; border-radius: 14px; display: grid; place-items: center; background: var(--ui); border:1px solid rgba(255,255,255,.25); font-size: 28px; user-select: none; }
+    .tray { position: absolute; top: 50%; right: .5rem; transform: translateY(-50%); background: var(--ui); border:1px solid rgba(255,255,255,.25); border-radius: 16px; padding:.5rem; display: grid; grid-template-columns: repeat(1, 64px); gap:.5rem; opacity: 0; pointer-events: none; transition: opacity .18s ease; }
+    .tray.open { opacity: 1; pointer-events: auto; }
+    .thumb { width: 64px; height: 64px; border-radius: 12px; background: rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.15); display: grid; place-items: center; font-size: 36px; }
+    .trash { position: absolute; left:.5rem; bottom: 5.6rem; width: 56px; height: 56px; border-radius: 14px; display: grid; place-items:center; background: var(--ui); border:1px solid rgba(255,255,255,.25); font-size: 24px; }
   </style>
   <!-- MediaPipe Hands (classic JS API) -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.min.js"></script>
@@ -32,6 +42,7 @@
   <div class="app">
     <video id="video" playsinline muted></video>
     <canvas id="overlay"></canvas>
+    <canvas id="stickers"></canvas>
     <canvas id="draw"></canvas>
 
     <div class="status" id="status">Ready — tap Start</div>
@@ -47,12 +58,18 @@
       </div>
     </div>
 
+    <div class="gift">
+      <div class="gift-toggle" id="giftBtn" title="Pinch near here to open/close">🎁</div>
+      <div class="tray" id="tray"></div>
+    </div>
+    <div class="trash" id="trash" title="Pinch + drop here to delete">🗑️</div>
+
     <div class="hud">
       <button id="startBtn" class="btn">▶️ Start camera</button>
       <button id="flipBtn" class="btn">🔄 Flip camera</button>
-      <button id="clearBtn" class="btn">🧼 Clear</button>
+      <button id="clearBtn" class="btn">🧼 Clear Drawing</button>
       <button id="saveBtn" class="btn">💾 Save PNG</button>
-      <span class="pill" id="modePill">✍️ Pinch to draw</span>
+      <span class="pill" id="modePill">✍️ Pinch to draw / move stickers</span>
       <span class="pill row"><span class="dot" id="cursorDot"></span> Cursor</span>
     </div>
   </div>
@@ -62,6 +79,8 @@
   const video = document.getElementById('video');
   const overlay = document.getElementById('overlay');
   const octx = overlay.getContext('2d');
+  const stickersCanvas = document.getElementById('stickers');
+  const sctx = stickersCanvas.getContext('2d');
   const draw = document.getElementById('draw');
   const dctx = draw.getContext('2d');
   const statusEl = document.getElementById('status');
@@ -73,26 +92,61 @@
   const widthEl = document.getElementById('width');
   const cursorDot = document.getElementById('cursorDot');
   const modePill = document.getElementById('modePill');
+  const giftBtn = document.getElementById('giftBtn');
+  const tray = document.getElementById('tray');
+  const trash = document.getElementById('trash');
 
-  let facingMode = 'user'; // 'user' (front) or 'environment' (rear)
-  let streaming = false;
-  let rafId = null;
-  let stream = null;
+  let facingMode = 'user';
+  let streaming = false; let rafId = null; let stream = null;
 
   // Drawing state
-  let isPinching = false; // when true, draw
-  let lastPt = null; // {x,y}
+  let isPinching = false; let lastPt = null; // for freehand
+
+  // Stickers
+  const STICKERS = [
+    { id:'hat', emoji:'🎩', w:120, h:70 },
+    { id:'sunglasses', emoji:'🕶️', w:140, h:50 },
+    { id:'mustache', emoji:'👨‍🦱', w:100, h:60 }, // fallback emoji (we'll also draw svg)
+    { id:'beard', emoji:'🧔', w:120, h:120 },
+  ];
+  // Lightweight SVGs for crisper look where possible
+  const SVGs = {
+    sunglasses: `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 70'>
+      <rect x='5' y='28' width='80' height='34' rx='10' fill='black'/>
+      <rect x='115' y='28' width='80' height='34' rx='10' fill='black'/>
+      <rect x='85' y='36' width='30' height='6' fill='black'/>
+    </svg>`,
+    mustache: `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 100'>
+      <path d='M10,70 C40,30 80,30 100,60 C120,30 160,30 190,70 C160,60 120,80 100,80 C80,80 40,60 10,70' fill='black'/>
+    </svg>`,
+    beard: `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'>
+      <path d='M50,60 C50,120 80,170 100,180 C120,170 150,120 150,60 C130,80 70,80 50,60' fill='black'/>
+    </svg>`,
+    hat: `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 220 140'>
+      <rect x='70' y='20' width='80' height='50' rx='8' fill='black'/>
+      <rect x='20' y='70' width='180' height='20' rx='8' fill='black'/>
+    </svg>`
+  };
+  const IMG = {};
+  for (const [k,svg] of Object.entries(SVGs)) {
+    const url = 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+    const im = new Image(); im.src = url; IMG[k] = im;
+  }
+
+  // placed stickers
+  const placed = []; // {id,x,y,w,h}
+  let dragging = null; // {index: idx in placed or -1 for new, id, offsetX, offsetY, fromTray:boolean}
 
   function setStatus(t) { statusEl.textContent = t; }
 
   function fitCanvases() {
     const w = video.videoWidth || overlay.clientWidth;
     const h = video.videoHeight || overlay.clientHeight;
-    [overlay, draw].forEach(c => { c.width = w; c.height = h; });
+    [overlay, stickersCanvas, draw].forEach(c => { c.width = w; c.height = h; });
+    renderStickers();
   }
 
   function toCanvasCoords(normX, normY) {
-    // MediaPipe provides normalized [0..1], but our video is mirrored for 'user' mode
     const x = (facingMode === 'user') ? (1 - normX) : normX;
     return { x: x * overlay.width, y: normY * overlay.height };
   }
@@ -102,155 +156,209 @@
   function drawLine(a, b) {
     dctx.strokeStyle = colorEl.value;
     dctx.lineWidth = parseFloat(widthEl.value);
-    dctx.lineCap = 'round';
-    dctx.lineJoin = 'round';
-    dctx.beginPath();
-    dctx.moveTo(a.x, a.y);
-    dctx.lineTo(b.x, b.y);
-    dctx.stroke();
+    dctx.lineCap = 'round'; dctx.lineJoin = 'round';
+    dctx.beginPath(); dctx.moveTo(a.x, a.y); dctx.lineTo(b.x, b.y); dctx.stroke();
   }
 
   function clearOverlay() { octx.clearRect(0,0,overlay.width, overlay.height); }
 
   function drawCursor(pt) {
-    const dot = cursorDot;
-    // Position the UI dot roughly at the finger tip in screen space
     const rect = overlay.getBoundingClientRect();
-    const ratioX = rect.width / overlay.width;
-    const ratioY = rect.height / overlay.height;
-    const cx = rect.left + pt.x * ratioX;
-    const cy = rect.top + pt.y * ratioY;
-    dot.style.transform = `translate(${Math.round(cx)}px, ${Math.round(cy)}px)`;
-    dot.style.position = 'fixed';
+    const ratioX = rect.width / overlay.width; const ratioY = rect.height / overlay.height;
+    const cx = rect.left + pt.x * ratioX; const cy = rect.top + pt.y * ratioY;
+    cursorDot.style.transform = `translate(${Math.round(cx)}px, ${Math.round(cy)}px)`;
+    cursorDot.style.position = 'fixed';
   }
 
-  // Set up MediaPipe Hands
+  function renderStickers() {
+    sctx.clearRect(0,0,stickersCanvas.width, stickersCanvas.height);
+    for (const s of placed) {
+      const im = IMG[s.id] || null;
+      if (im && im.complete) sctx.drawImage(im, s.x - s.w/2, s.y - s.h/2, s.w, s.h);
+      else { // fallback emoji if image not ready
+        sctx.save(); sctx.font = `${Math.max(s.w,s.h)}px system-ui`; sctx.textAlign='center'; sctx.textBaseline='middle'; sctx.fillText('🎁', s.x, s.y); sctx.restore();
+      }
+    }
+  }
+
+  function pointInRect(pt, x,y,w,h){ return pt.x>=x && pt.x<=x+w && pt.y>=y && pt.y<=y+h; }
+
+  // Gift tray thumbnails (DOM)
+  function populateTray(){
+    tray.innerHTML='';
+    STICKERS.forEach(s => {
+      const el = document.createElement('div'); el.className='thumb'; el.dataset.id=s.id; el.title = s.id;
+      el.textContent = ' ';
+      // Render an inline preview with emoji via CSS background using canvas is heavy; keep as emoji char here
+      const span = document.createElement('span'); span.style.fontSize='36px';
+      span.textContent = s.id==='sunglasses'? '🕶️' : (s.id==='mustache'? '👨‍🦱' : (s.id==='beard'? '🧔' : '🎩'));
+      el.appendChild(span);
+      tray.appendChild(el);
+    });
+  }
+  populateTray();
+
+  function getCanvasRect(){ return overlay.getBoundingClientRect(); }
+  function screenToCanvas(x,y){ const r=getCanvasRect(); return { x:(x-r.left)/r.width*overlay.width, y:(y-r.top)/r.height*overlay.height } }
+
+  // Hit test helpers
+  function hitPlaced(pt){
+    for (let i=placed.length-1;i>=0;i--){ const s=placed[i]; if (pointInRect(pt, s.x - s.w/2, s.y - s.h/2, s.w, s.h)) return i; }
+    return -1;
+  }
+
+  // Gesture → UI regions
+  function rectOfGiftBtn(){
+    const r = giftBtn.getBoundingClientRect(); const c = screenToCanvas(r.left + r.width/2, r.top + r.height/2); // center
+    const rw = r.width / getCanvasRect().width * overlay.width; const rh = r.height / getCanvasRect().height * overlay.height;
+    return { x: c.x - rw/2, y: c.y - rh/2, w: rw, h: rh };
+  }
+  function rectOfTrash(){
+    const r = trash.getBoundingClientRect(); const c = screenToCanvas(r.left + r.width/2, r.top + r.height/2);
+    const rw = r.width / getCanvasRect().width * overlay.width; const rh = r.height / getCanvasRect().height * overlay.height;
+    return { x: c.x - rw/2, y: c.y - rh/2, w: rw, h: rh };
+  }
+
+  let lastToggleAt = 0;
+  function maybeToggleTray(pt){
+    const g = rectOfGiftBtn();
+    if (pointInRect(pt, g.x, g.y, g.w, g.h)){
+      const now = performance.now();
+      if (now - lastToggleAt > 600){ // debounce
+        tray.classList.toggle('open');
+        lastToggleAt = now;
+      }
+    }
+  }
+
+  function tryStartDragFromTray(pt){
+    if (!tray.classList.contains('open')) return false;
+    // map finger pt to tray DOM space to see which thumb we're over
+    const r = tray.getBoundingClientRect();
+    const {x, y} = getCanvasRect(); // not used, keep API
+    const screen = { sx: pt.x / overlay.width * r.width + r.left, sy: pt.y / overlay.height * r.height + r.top };
+    const el = document.elementFromPoint(screen.sx, screen.sy);
+    if (!el) return false;
+    const holder = el.closest('.thumb');
+    if (holder && holder.dataset.id){
+      const def = STICKERS.find(s=>s.id===holder.dataset.id);
+      dragging = { index:-1, id:def.id, offsetX:0, offsetY:0, fromTray:true, w:def.w, h:def.h };
+      return true;
+    }
+    return false;
+  }
+
+  function startDragExisting(idx, pt){
+    const s = placed[idx];
+    dragging = { index: idx, id: s.id, offsetX: pt.x - s.x, offsetY: pt.y - s.y, fromTray:false, w:s.w, h:s.h };
+  }
+
+  function updateDrag(pt){
+    if (!dragging) return;
+    if (dragging.index>=0){
+      const s = placed[dragging.index]; s.x = pt.x - dragging.offsetX; s.y = pt.y - dragging.offsetY;
+    } else {
+      // preview new sticker while dragging from tray
+      // draw preview on stickers canvas without committing
+    }
+    renderStickers();
+  }
+
+  function endDrag(pt){
+    if (!dragging) return;
+    const tr = rectOfTrash();
+    if (pointInRect(pt, tr.x, tr.y, tr.w, tr.h)){
+      // delete
+      if (dragging.index>=0) { placed.splice(dragging.index,1); }
+      dragging = null; renderStickers(); return;
+    }
+    if (dragging.index>=0){ dragging = null; renderStickers(); return; }
+    // commit new sticker
+    placed.push({ id: dragging.id, x: pt.x, y: pt.y, w: dragging.w, h: dragging.h });
+    dragging = null; renderStickers();
+  }
+
+  // MediaPipe Hands
   const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
-  hands.setOptions({
-    maxNumHands: 1,
-    modelComplexity: 1,
-    minDetectionConfidence: 0.6,
-    minTrackingConfidence: 0.5
-  });
+  hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
 
   hands.onResults((results) => {
     clearOverlay();
     if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
-      lastPt = null; isPinching = false; modePill.textContent = '✍️ Pinch to draw';
+      lastPt = null; isPinching = false; modePill.textContent = '✍️ Pinch to draw / move stickers';
       return;
     }
-
     const lm = results.multiHandLandmarks[0];
-    // Indices: 4 = Thumb tip, 8 = Index tip, 5 = Index MCP (as scale ref), 0 = wrist
     const tipIndex = toCanvasCoords(lm[8].x, lm[8].y);
     const tipThumb = toCanvasCoords(lm[4].x, lm[4].y);
     const wrist = toCanvasCoords(lm[0].x, lm[0].y);
     const mcpIndex = toCanvasCoords(lm[5].x, lm[5].y);
 
-    // Dynamic pinch threshold relative to hand size
     const handScale = Math.max(10, dist(wrist, mcpIndex));
     const pinchDistance = dist(tipIndex, tipThumb);
-    const pinch = pinchDistance < handScale * 0.35; // tweakable multiplier
+    const pinch = pinchDistance < handScale * 0.35;
 
-    // Draw skeleton overlay (optional, light)
-    octx.lineWidth = 2; octx.strokeStyle = 'rgba(255,255,255,.35)';
-    octx.fillStyle = 'rgba(255,255,255,.6)';
-    lm.forEach(p => {
-      const c = toCanvasCoords(p.x, p.y);
-      octx.beginPath(); octx.arc(c.x, c.y, 2, 0, Math.PI*2); octx.fill();
-    });
+    // skeleton dots (subtle)
+    octx.lineWidth = 2; octx.strokeStyle = 'rgba(255,255,255,.35)'; octx.fillStyle = 'rgba(255,255,255,.6)';
+    lm.forEach(p => { const c = toCanvasCoords(p.x, p.y); octx.beginPath(); octx.arc(c.x, c.y, 2, 0, Math.PI*2); octx.fill(); });
 
-    // Update cursor and draw when pinching
     drawCursor(tipIndex);
 
+    // TRAY TOGGLE: pinch over 🎁
+    if (pinch && !isPinching) { // just began
+      maybeToggleTray(tipIndex);
+      // Try initiating a drag from tray or existing sticker
+      const idx = hitPlaced(tipIndex);
+      if (idx>=0) startDragExisting(idx, tipIndex); else tryStartDragFromTray(tipIndex);
+    }
+
     if (pinch) {
-      modePill.textContent = '✍️ Drawing (pinch)';
-      if (lastPt) drawLine(lastPt, tipIndex);
-      lastPt = tipIndex;
+      modePill.textContent = dragging? '🧲 Moving sticker' : '✍️ Drawing (pinch)';
+      if (dragging){ updateDrag(tipIndex); }
+      else { if (lastPt) drawLine(lastPt, tipIndex); lastPt = tipIndex; }
     } else {
-      modePill.textContent = '✍️ Pinch to draw';
+      if (dragging) endDrag(tipIndex);
+      modePill.textContent = '✍️ Pinch to draw / move stickers';
       lastPt = null;
     }
+    isPinching = pinch;
   });
 
   async function startCamera() {
     try {
       setStatus('Requesting camera…');
       stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode }, audio: false });
-      video.srcObject = stream;
-      await video.play();
-      streaming = true;
-      setStatus('Camera on — hold up your hand');
+      video.srcObject = stream; await video.play(); streaming = true; setStatus('Camera on — hand gestures enabled');
       fitCanvases();
-      // Use MediaPipe camera helper for paced frames OR manual RAF loop. Here we do RAF loop for smoother UI.
-      const loop = async () => {
-        if (!streaming) return;
-        await hands.send({ image: video });
-        rafId = requestAnimationFrame(loop);
-      };
+      const loop = async () => { if (!streaming) return; await hands.send({ image: video }); rafId = requestAnimationFrame(loop); };
       loop();
-    } catch (err) {
-      console.error(err);
-      setStatus('Camera error: ' + (err.message || err));
-    }
+    } catch (err) { console.error(err); setStatus('Camera error: ' + (err.message || err)); }
   }
 
   function stopCamera() {
-    streaming = false;
-    if (rafId) cancelAnimationFrame(rafId);
-    if (stream) {
-      stream.getTracks().forEach(t => t.stop());
-      stream = null;
-    }
+    streaming = false; if (rafId) cancelAnimationFrame(rafId);
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     setStatus('Stopped');
   }
 
-  async function flipCamera() {
-    facingMode = (facingMode === 'user') ? 'environment' : 'user';
-    if (streaming) {
-      stopCamera();
-      await startCamera();
-    }
-  }
+  async function flipCamera() { facingMode = (facingMode === 'user') ? 'environment' : 'user'; if (streaming) { stopCamera(); await startCamera(); } }
 
-  startBtn.addEventListener('click', async () => {
-    if (!streaming) {
-      await startCamera();
-      startBtn.textContent = '⏹ Stop camera';
-    } else {
-      stopCamera();
-      startBtn.textContent = '▶️ Start camera';
-    }
-  });
-
+  startBtn.addEventListener('click', async () => { if (!streaming) { await startCamera(); startBtn.textContent = '⏹ Stop camera'; } else { stopCamera(); startBtn.textContent = '▶️ Start camera'; } });
   flipBtn.addEventListener('click', flipCamera);
-
-  clearBtn.addEventListener('click', () => {
-    dctx.clearRect(0,0,draw.width, draw.height);
-  });
+  clearBtn.addEventListener('click', () => { dctx.clearRect(0,0,draw.width, draw.height); });
 
   saveBtn.addEventListener('click', () => {
-    // Composite the drawing over a snapshot of current video frame
-    const exportCanvas = document.createElement('canvas');
-    exportCanvas.width = draw.width; exportCanvas.height = draw.height;
-    const ex = exportCanvas.getContext('2d');
-    // Draw current video frame
-    ex.save();
-    if (facingMode === 'user') { // mirror back to non-mirrored export
-      ex.translate(exportCanvas.width, 0); ex.scale(-1, 1);
-    }
-    ex.drawImage(video, 0, 0, exportCanvas.width, exportCanvas.height);
-    ex.restore();
-    // Overlay drawing
+    // export with video + stickers + drawing
+    const exportCanvas = document.createElement('canvas'); exportCanvas.width = draw.width; exportCanvas.height = draw.height; const ex = exportCanvas.getContext('2d');
+    ex.save(); if (facingMode === 'user') { ex.translate(exportCanvas.width, 0); ex.scale(-1, 1); } ex.drawImage(video, 0, 0, exportCanvas.width, exportCanvas.height); ex.restore();
+    // stickers
+    ex.drawImage(stickersCanvas, 0, 0);
+    // drawing
     ex.drawImage(draw, 0, 0);
-    const url = exportCanvas.toDataURL('image/png');
-    const a = document.createElement('a'); a.href = url; a.download = 'hand-draw.png'; a.click();
+    const url = exportCanvas.toDataURL('image/png'); const a = document.createElement('a'); a.href = url; a.download = 'hand-draw.png'; a.click();
   });
 
-  window.addEventListener('resize', fitCanvases);
-  video.addEventListener('loadedmetadata', fitCanvases);
-
-  // iOS Safari hint: require a user gesture to start; we already gate on Start button.
+  window.addEventListener('resize', fitCanvases); video.addEventListener('loadedmetadata', fitCanvases);
 })();
 </script>
 </body>
