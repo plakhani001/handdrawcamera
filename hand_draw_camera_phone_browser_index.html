@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hand-Draw Camera</title>
+  <style>
+    :root { --ui: rgba(20,20,20,.85); --accent: #4f8cff; }
+    html, body { height: 100%; margin: 0; background:#000; color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    .app { position: fixed; inset: 0; overflow: hidden; }
+    video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); /* mirror for selfie */ }
+    canvas#overlay { position: absolute; inset: 0; pointer-events: none; }
+    canvas#draw { position: absolute; inset: 0; touch-action: none; }
+    .hud { position: absolute; left: 0; right: 0; bottom: 0; display: flex; gap: .5rem; padding: .75rem; flex-wrap: wrap; justify-content: center; background: linear-gradient(180deg, transparent, rgba(0,0,0,.35)); }
+    .btn, .pill { appearance: none; border: 1px solid rgba(255,255,255,.2); background: var(--ui); color: #fff; padding: .6rem .9rem; border-radius: 999px; font-size: 14px; display: inline-flex; align-items: center; gap: .5rem; backdrop-filter: blur(6px); }
+    .btn:hover { background: rgba(40,40,40,.9); }
+    .row { display: flex; gap: .5rem; align-items: center; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+    .status { position: absolute; top: .5rem; left: 50%; transform: translateX(-50%); background: var(--ui); padding: .35rem .7rem; border-radius: 999px; font-size: 12px; border:1px solid rgba(255,255,255,.2) }
+    .toolbar { position: absolute; top: .5rem; right: .5rem; display: grid; gap:.5rem; }
+    .toolbar > * { background: var(--ui); border:1px solid rgba(255,255,255,.2); border-radius: .75rem; padding: .5rem; }
+    label { font-size: 12px; opacity: .85; }
+    input[type=color] { inline-size: 40px; block-size: 28px; border: none; background: transparent; padding: 0; }
+    input[type=range] { width: 120px; }
+  </style>
+  <!-- MediaPipe Hands (classic JS API) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+</head>
+<body>
+  <div class="app">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <canvas id="draw"></canvas>
+
+    <div class="status" id="status">Ready — tap Start</div>
+
+    <div class="toolbar">
+      <div class="row" title="Stroke color">
+        <label>Color</label>
+        <input id="color" type="color" value="#4f8cff" />
+      </div>
+      <div class="row" title="Stroke width">
+        <label>Width</label>
+        <input id="width" type="range" min="1" max="20" step="1" value="4" />
+      </div>
+    </div>
+
+    <div class="hud">
+      <button id="startBtn" class="btn">▶️ Start camera</button>
+      <button id="flipBtn" class="btn">🔄 Flip camera</button>
+      <button id="clearBtn" class="btn">🧼 Clear</button>
+      <button id="saveBtn" class="btn">💾 Save PNG</button>
+      <span class="pill" id="modePill">✍️ Pinch to draw</span>
+      <span class="pill row"><span class="dot" id="cursorDot"></span> Cursor</span>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const video = document.getElementById('video');
+  const overlay = document.getElementById('overlay');
+  const octx = overlay.getContext('2d');
+  const draw = document.getElementById('draw');
+  const dctx = draw.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const startBtn = document.getElementById('startBtn');
+  const flipBtn = document.getElementById('flipBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const saveBtn = document.getElementById('saveBtn');
+  const colorEl = document.getElementById('color');
+  const widthEl = document.getElementById('width');
+  const cursorDot = document.getElementById('cursorDot');
+  const modePill = document.getElementById('modePill');
+
+  let facingMode = 'user'; // 'user' (front) or 'environment' (rear)
+  let streaming = false;
+  let rafId = null;
+  let stream = null;
+
+  // Drawing state
+  let isPinching = false; // when true, draw
+  let lastPt = null; // {x,y}
+
+  function setStatus(t) { statusEl.textContent = t; }
+
+  function fitCanvases() {
+    const w = video.videoWidth || overlay.clientWidth;
+    const h = video.videoHeight || overlay.clientHeight;
+    [overlay, draw].forEach(c => { c.width = w; c.height = h; });
+  }
+
+  function toCanvasCoords(normX, normY) {
+    // MediaPipe provides normalized [0..1], but our video is mirrored for 'user' mode
+    const x = (facingMode === 'user') ? (1 - normX) : normX;
+    return { x: x * overlay.width, y: normY * overlay.height };
+  }
+
+  function dist(a, b) { const dx = a.x - b.x, dy = a.y - b.y; return Math.hypot(dx, dy); }
+
+  function drawLine(a, b) {
+    dctx.strokeStyle = colorEl.value;
+    dctx.lineWidth = parseFloat(widthEl.value);
+    dctx.lineCap = 'round';
+    dctx.lineJoin = 'round';
+    dctx.beginPath();
+    dctx.moveTo(a.x, a.y);
+    dctx.lineTo(b.x, b.y);
+    dctx.stroke();
+  }
+
+  function clearOverlay() { octx.clearRect(0,0,overlay.width, overlay.height); }
+
+  function drawCursor(pt) {
+    const dot = cursorDot;
+    // Position the UI dot roughly at the finger tip in screen space
+    const rect = overlay.getBoundingClientRect();
+    const ratioX = rect.width / overlay.width;
+    const ratioY = rect.height / overlay.height;
+    const cx = rect.left + pt.x * ratioX;
+    const cy = rect.top + pt.y * ratioY;
+    dot.style.transform = `translate(${Math.round(cx)}px, ${Math.round(cy)}px)`;
+    dot.style.position = 'fixed';
+  }
+
+  // Set up MediaPipe Hands
+  const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.5
+  });
+
+  hands.onResults((results) => {
+    clearOverlay();
+    if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+      lastPt = null; isPinching = false; modePill.textContent = '✍️ Pinch to draw';
+      return;
+    }
+
+    const lm = results.multiHandLandmarks[0];
+    // Indices: 4 = Thumb tip, 8 = Index tip, 5 = Index MCP (as scale ref), 0 = wrist
+    const tipIndex = toCanvasCoords(lm[8].x, lm[8].y);
+    const tipThumb = toCanvasCoords(lm[4].x, lm[4].y);
+    const wrist = toCanvasCoords(lm[0].x, lm[0].y);
+    const mcpIndex = toCanvasCoords(lm[5].x, lm[5].y);
+
+    // Dynamic pinch threshold relative to hand size
+    const handScale = Math.max(10, dist(wrist, mcpIndex));
+    const pinchDistance = dist(tipIndex, tipThumb);
+    const pinch = pinchDistance < handScale * 0.35; // tweakable multiplier
+
+    // Draw skeleton overlay (optional, light)
+    octx.lineWidth = 2; octx.strokeStyle = 'rgba(255,255,255,.35)';
+    octx.fillStyle = 'rgba(255,255,255,.6)';
+    lm.forEach(p => {
+      const c = toCanvasCoords(p.x, p.y);
+      octx.beginPath(); octx.arc(c.x, c.y, 2, 0, Math.PI*2); octx.fill();
+    });
+
+    // Update cursor and draw when pinching
+    drawCursor(tipIndex);
+
+    if (pinch) {
+      modePill.textContent = '✍️ Drawing (pinch)';
+      if (lastPt) drawLine(lastPt, tipIndex);
+      lastPt = tipIndex;
+    } else {
+      modePill.textContent = '✍️ Pinch to draw';
+      lastPt = null;
+    }
+  });
+
+  async function startCamera() {
+    try {
+      setStatus('Requesting camera…');
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode }, audio: false });
+      video.srcObject = stream;
+      await video.play();
+      streaming = true;
+      setStatus('Camera on — hold up your hand');
+      fitCanvases();
+      // Use MediaPipe camera helper for paced frames OR manual RAF loop. Here we do RAF loop for smoother UI.
+      const loop = async () => {
+        if (!streaming) return;
+        await hands.send({ image: video });
+        rafId = requestAnimationFrame(loop);
+      };
+      loop();
+    } catch (err) {
+      console.error(err);
+      setStatus('Camera error: ' + (err.message || err));
+    }
+  }
+
+  function stopCamera() {
+    streaming = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    setStatus('Stopped');
+  }
+
+  async function flipCamera() {
+    facingMode = (facingMode === 'user') ? 'environment' : 'user';
+    if (streaming) {
+      stopCamera();
+      await startCamera();
+    }
+  }
+
+  startBtn.addEventListener('click', async () => {
+    if (!streaming) {
+      await startCamera();
+      startBtn.textContent = '⏹ Stop camera';
+    } else {
+      stopCamera();
+      startBtn.textContent = '▶️ Start camera';
+    }
+  });
+
+  flipBtn.addEventListener('click', flipCamera);
+
+  clearBtn.addEventListener('click', () => {
+    dctx.clearRect(0,0,draw.width, draw.height);
+  });
+
+  saveBtn.addEventListener('click', () => {
+    // Composite the drawing over a snapshot of current video frame
+    const exportCanvas = document.createElement('canvas');
+    exportCanvas.width = draw.width; exportCanvas.height = draw.height;
+    const ex = exportCanvas.getContext('2d');
+    // Draw current video frame
+    ex.save();
+    if (facingMode === 'user') { // mirror back to non-mirrored export
+      ex.translate(exportCanvas.width, 0); ex.scale(-1, 1);
+    }
+    ex.drawImage(video, 0, 0, exportCanvas.width, exportCanvas.height);
+    ex.restore();
+    // Overlay drawing
+    ex.drawImage(draw, 0, 0);
+    const url = exportCanvas.toDataURL('image/png');
+    const a = document.createElement('a'); a.href = url; a.download = 'hand-draw.png'; a.click();
+  });
+
+  window.addEventListener('resize', fitCanvases);
+  video.addEventListener('loadedmetadata', fitCanvases);
+
+  // iOS Safari hint: require a user gesture to start; we already gate on Start button.
+})();
+</script>
+</body>
+</html>
